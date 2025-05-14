@@ -24,8 +24,8 @@ NUM_JOINTS = 20
 
 # joint pos + joint vel + timestep phase + projected_gravity + imu_gyro + imu_acc
 OBS_SIZE = 20 * 2 + 4 + 3 + 3 + 3
-# lin_vel_cmd + ang_vel_cmd + gait_freq_cmd
-CMD_SIZE = 2 + 1 + 1
+# joystick (7 values) + gait_freq_cmd
+CMD_SIZE = 7 + 1
 
 NUM_ACTOR_INPUTS = OBS_SIZE + CMD_SIZE
 NUM_CRITIC_INPUTS = NUM_ACTOR_INPUTS + 4 + 6 + 3 + 4 + 3 + 3 + 20
@@ -221,7 +221,6 @@ class TimestepPhaseObservation(ksim.TimestepObservation):
     """Observation of the phase of the timestep."""
 
     ctrl_dt: float = attrs.field(default=0.02)
-    stand_still_threshold: float = attrs.field(default=0.0)
 
     def observe(self, state: ksim.ObservationInput, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
         gait_freq = state.commands["gait_frequency_command"]
@@ -233,11 +232,11 @@ class TimestepPhaseObservation(ksim.TimestepObservation):
         phase = jnp.fmod(phase + jnp.pi, 2 * jnp.pi) - jnp.pi
 
         # Stand still case
-        vel_cmd = state.commands["linear_velocity_command"]
-        ang_vel_cmd = state.commands["angular_velocity_command"]
-        cmd_norm = jnp.linalg.norm(jnp.concatenate([vel_cmd, ang_vel_cmd], axis=-1), axis=-1)
+        joystick_cmd = state.commands["joystick_command"]
+        # Check if the "stand still" command (index 0 of one-hot encoded vector) is active.
+        is_stand_still_command = joystick_cmd[..., 0] == 1.0
         phase = jnp.where(
-            cmd_norm < self.stand_still_threshold,
+            is_stand_still_command,
             jnp.array([jnp.pi / 2, jnp.pi]),  # stand still position
             phase,
         )
@@ -251,8 +250,7 @@ class FeetPhaseReward(ksim.Reward):
 
     scale: float = 1.0
     feet_pos_obs_name: str = attrs.field(default="feet_position_observation")
-    linear_velocity_cmd_name: str = attrs.field(default="linear_velocity_command")
-    angular_velocity_cmd_name: str = attrs.field(default="angular_velocity_command")
+    joystick_cmd_name: str = attrs.field(default="joystick_command")
     gait_freq_cmd_name: str = attrs.field(default="gait_frequency_command")
     max_foot_height: float = attrs.field(default=0.12)
     ctrl_dt: float = attrs.field(default=0.02)
@@ -265,6 +263,8 @@ class FeetPhaseReward(ksim.Reward):
             raise ValueError(f"Observation {self.feet_pos_obs_name} not found; add it as an observation in your task.")
         if self.gait_freq_cmd_name not in trajectory.command:
             raise ValueError(f"Command {self.gait_freq_cmd_name} not found; add it as a command in your task.")
+        if self.joystick_cmd_name not in trajectory.command:
+            raise ValueError(f"Command {self.joystick_cmd_name} not found; add it as a command in your task.")
 
         # generate phase values
         gait_freq_n = trajectory.command[self.gait_freq_cmd_name]
@@ -285,11 +285,9 @@ class FeetPhaseReward(ksim.Reward):
         error = jnp.sum(jnp.square(foot_z - ideal_z), axis=-1)
         reward = jnp.exp(-error / self.sensitivity)
 
-        # no movement for small velocity command
-        vel_cmd = trajectory.command[self.linear_velocity_cmd_name]
-        ang_vel_cmd = trajectory.command[self.angular_velocity_cmd_name]
-        command_norm = jnp.linalg.norm(jnp.concatenate([vel_cmd, ang_vel_cmd], axis=-1), axis=-1)
-        reward *= command_norm > self.stand_still_threshold
+        # Modulate reward based on joystick command.
+        is_stand_still_active = trajectory.command[self.joystick_cmd_name][..., 0]
+        reward *= (1.0 - is_stand_still_active)
 
         return reward
 
@@ -764,6 +762,14 @@ class KbotWalkingTaskConfig(ksim.PPOConfig):
         value=0.01,
         help="The threshold for standing still.",
     )
+    target_linear_velocity: float = xax.field(
+        value=1.0,
+        help="The target linear velocity.",
+    )
+    target_angular_velocity: float = xax.field(
+        value=math.radians(45),
+        help="The target angular velocity.",
+    )
     # Model parameters.
     hidden_size: int = xax.field(
         value=128,
@@ -830,7 +836,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
         metadata: RobotURDFMetadataOutput | None = None,
     ) -> ksim.Actuators:
         assert metadata is not None, "Metadata is required"
-        return ksim.MITPositionActuators(
+        return ksim.PositionActuators(
             physics_model=physics_model,
             metadata=metadata,
         )
@@ -851,7 +857,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
                 x_force=3.0,
                 y_force=3.0,
                 z_force=0.3,
-                force_range=(0.5, 1.0),
+                force_range=(0.1, 1.0),
                 x_angular_force=0.1,
                 y_angular_force=0.1,
                 z_angular_force=1.0,
@@ -869,7 +875,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
 
     def get_observations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Observation]:
         return [
-            TimestepPhaseObservation(stand_still_threshold=self.config.stand_still_threshold),
+            TimestepPhaseObservation(ctrl_dt=self.config.ctrl_dt),
             ksim.JointPositionObservation(noise=math.radians(2)),
             ksim.JointVelocityObservation(noise=math.radians(10)),
             ksim.ActuatorForceObservation(),
@@ -923,18 +929,8 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
         return [
-            LinearVelocityCommand(
-                x_range=(-0.3, 0.7),
-                y_range=(-0.2, 0.2),
-                x_zero_prob=0.3,
-                y_zero_prob=0.4,
-                switch_prob=self.config.ctrl_dt / 3,  # once per 3 seconds
-            ),
-            AngularVelocityCommand(
-                scale=0.1,
-                zero_prob=0.9,
-                switch_prob=self.config.ctrl_dt / 3,  # once per 3 seconds
-            ),
+            ksim.StartQuaternionCommand(),
+            ksim.JoystickCommand(),
             GaitFrequencyCommand(
                 gait_freq_lower=self.config.gait_freq_lower,
                 gait_freq_upper=self.config.gait_freq_upper,
@@ -944,26 +940,23 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
             # Standard rewards.
-            ksim.StayAliveReward(scale=1.0),
+            ksim.StayAliveReward(scale=20.0),
             ksim.UprightReward(scale=1.0),
             # Avoid movement penalties.
             ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.005),
             ksim.LinearVelocityPenalty(index=("z"), scale=-0.005),
-            LinearVelocityTrackingReward(
-                scale=2.0,
-                stand_still_threshold=self.config.stand_still_threshold,
-            ),
-            AngularVelocityTrackingReward(
-                scale=1.0,
-                stand_still_threshold=self.config.stand_still_threshold,
+            ksim.JoystickReward(
+                forward_speed=self.config.target_linear_velocity,
+                backward_speed=self.config.target_linear_velocity / 2.0,
+                strafe_speed=self.config.target_linear_velocity / 2.0,
+                rotation_speed=self.config.target_angular_velocity,
+                scale=1.5,
             ),
             # Normalization penalties.
-            ksim.ActionInBoundsReward.create(physics_model, scale=0.01),
             ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01),
-            ksim.ActionNearPositionPenalty(joint_threshold=math.radians(2.0), scale=-0.01),
             ksim.JointVelocityPenalty(scale=-0.01, scale_by_curriculum=True),
-            ksim.ActionSmoothnessPenalty(scale=-0.01),
-            ksim.ActuatorRelativeForcePenalty.create(physics_model, scale=-0.01),
+            ksim.ActionAccelerationPenalty(scale=-0.01),
+            ksim.CtrlPenalty(scale=-0.01, scale_by_curriculum=True),
             # Bespoke rewards.
             BentArmPenalty.create_penalty(physics_model, scale=-0.1),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.1),
@@ -982,9 +975,8 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
         return [
-            ksim.BadZTermination(unhealthy_z_lower=-0.3, unhealthy_z_upper=3.0),
+            ksim.BadZTermination(unhealthy_z_lower=0.3, unhealthy_z_upper=3.0),
             ksim.NotUprightTermination(max_radians=math.radians(60)),
-            ksim.HighVelocityTermination(),
             ksim.FarFromOriginTermination(max_dist=10.0),
         ]
 
@@ -1019,8 +1011,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
-        lin_vel_cmd_2 = commands["linear_velocity_command"]
-        ang_vel_cmd = commands["angular_velocity_command"]
+        joystick_cmd_ohe_7 = commands["joystick_command"]
         gait_freq_cmd = commands["gait_frequency_command"]
 
         obs_n = jnp.concatenate(
@@ -1031,8 +1022,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
                 proj_grav_3,  # 3
                 imu_acc_3,  # 3
                 imu_gyro_3,  # 3
-                lin_vel_cmd_2,  # 2
-                ang_vel_cmd,  # 1
+                joystick_cmd_ohe_7,  # 7
                 gait_freq_cmd,  # 1
             ],
             axis=-1,
@@ -1055,8 +1045,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
         imu_acc_3 = observations["sensor_observation_imu_acc"]
-        lin_vel_cmd_2 = commands["linear_velocity_command"]
-        ang_vel_cmd = commands["angular_velocity_command"]
+        joystick_cmd_ohe_7 = commands["joystick_command"]
         gait_freq_cmd = commands["gait_frequency_command"]
         # Privileged observations
         feet_contact_4 = observations["feet_contact_observation"]
@@ -1066,7 +1055,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
         base_linear_velocity_3 = observations["base_linear_velocity_observation"]
         base_angular_velocity_3 = observations["base_angular_velocity_observation"]
         actuator_force_n = observations["actuator_force_observation"]
-        
+
         obs_n = jnp.concatenate(
             [
                 timestep_phase_4,  # 4
@@ -1075,8 +1064,7 @@ class KbotWalkingTask(ksim.PPOTask[KbotWalkingTaskConfig]):
                 proj_grav_3,  # 3
                 imu_acc_3,  # 3
                 imu_gyro_3,  # 3
-                lin_vel_cmd_2,  # 2
-                ang_vel_cmd,  # 1
+                joystick_cmd_ohe_7,  # 7
                 gait_freq_cmd,  # 1
                 feet_contact_4,  # 4
                 feet_position_6,  # 6
@@ -1183,7 +1171,7 @@ if __name__ == "__main__":
             ctrl_dt=0.02,
             iterations=8,
             ls_iterations=8,
-            max_action_latency=0.01,
+            action_latency_range=(0, 0.01),
             # Checkpointing parameters.
             save_every_n_seconds=60,
         ),
